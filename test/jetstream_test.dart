@@ -448,9 +448,24 @@ void main() {
     });
 
     test('Account Info details', () async {
+      final streamName = 'account-info-test';
+      await js.createStream(StreamConfig(
+        name: streamName,
+        subjects: ['account-info-test.>'],
+        storage: 'memory',
+      ));
+
       final accInfo = await js.accountInfo();
-      expect(accInfo.tier.memory, isNotNull);
-      expect(accInfo.tier.consumers, isNotNull);
+      // Regression guard: `Tier.fromJson` used to always parse an empty map
+      // (the response has no nested `tier` key for a single-tier account),
+      // so every one of these silently came back as 0 regardless of real
+      // account state. Asserting `isNotNull` alone doesn't catch that, since
+      // 0 is not null — assert the stream we just created is actually
+      // reflected in the count.
+      expect(accInfo.tier.streams, greaterThanOrEqualTo(1));
+      expect(accInfo.api.total, greaterThan(0));
+
+      await js.deleteStream(streamName);
     });
   });
 }

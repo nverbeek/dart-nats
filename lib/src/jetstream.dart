@@ -1308,12 +1308,16 @@ class Tier {
   /// Factory from JSON map
   factory Tier.fromJson(Map<String, dynamic> json) {
     return Tier(
-      memory: json['memory'] as int? ?? 0,
-      storage: json['storage'] as int? ?? 0,
-      reservedMemory: json['reserved_memory'] as int? ?? 0,
-      reservedStorage: json['reserved_storage'] as int? ?? 0,
-      streams: json['streams'] as int? ?? 0,
-      consumers: json['consumers'] as int? ?? 0,
+      // Read as `num` rather than `int`: a server represents an unset
+      // reserved limit as a uint64 `-1` ("no limit") sentinel, which after
+      // JSON round-tripping through a double can arrive as e.g.
+      // `18446744073709552000.0` — a strict `as int?` cast throws on that.
+      memory: (json['memory'] as num?)?.toInt() ?? 0,
+      storage: (json['storage'] as num?)?.toInt() ?? 0,
+      reservedMemory: (json['reserved_memory'] as num?)?.toInt() ?? 0,
+      reservedStorage: (json['reserved_storage'] as num?)?.toInt() ?? 0,
+      streams: (json['streams'] as num?)?.toInt() ?? 0,
+      consumers: (json['consumers'] as num?)?.toInt() ?? 0,
     );
   }
 }
@@ -1384,7 +1388,15 @@ class AccountInfo {
     return AccountInfo(
       domain: json['domain'] as String? ?? '',
       api: APIStats.fromJson(json['api'] as Map<String, dynamic>? ?? {}),
-      tier: Tier.fromJson(json['tier'] as Map<String, dynamic>? ?? {}),
+      // The `$JS.API.INFO` response has no nested `tier` key — a server puts
+      // an account's own usage/limits (`memory`, `storage`, `streams`,
+      // `consumers`, `reserved_memory`, `reserved_storage`) at the top
+      // level, so `Tier.fromJson(json['tier'])` was always parsing an empty
+      // map and silently returning an all-zero `Tier`. Verified against a
+      // live server: `Tier.fromJson(json)` reads the real fields directly,
+      // and stays correct for multi-tier accounts too, since `json` there
+      // still carries the account-wide aggregate alongside `tiers`.
+      tier: Tier.fromJson(json),
       tiers: tiersMap,
     );
   }
