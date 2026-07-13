@@ -9,3 +9,5 @@ export 'src/subscription.dart';
 export 'src/jetstream.dart';
 export 'src/kv.dart';
 export 'src/object_store.dart';
+export 'src/micro.dart';
+

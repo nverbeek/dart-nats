@@ -42,11 +42,13 @@ class Info {
   ///client id assigned by server
   int? clientId;
 
+  /// Dynamic cluster connect URLs
+  List<String>? connectUrls;
+
   //todo
   //authen required
   //tls_required
   //tls_verify
-  //connect_url
 
   ///constructure
   Info(
@@ -60,7 +62,8 @@ class Info {
       this.tlsRequired,
       this.maxPayload,
       this.nonce,
-      this.clientId});
+      this.clientId,
+      this.connectUrls});
 
   ///constructure from json
   Info.fromJson(Map<String, dynamic> json) {
@@ -75,6 +78,9 @@ class Info {
     maxPayload = json['max_payload'];
     nonce = json['nonce'];
     clientId = json['client_id'];
+    if (json['connect_urls'] != null) {
+      connectUrls = List<String>.from(json['connect_urls']);
+    }
   }
 
   ///convert to json
@@ -91,6 +97,7 @@ class Info {
     data['max_payload'] = maxPayload;
     data['nonce'] = nonce;
     data['client_id'] = clientId;
+    data['connect_urls'] = connectUrls;
 
     return _removeNull(data);
   }

@@ -154,6 +154,21 @@ class Client {
   final _subs = <int, Subscription>{};
   final _backendSubs = <int, bool>{};
   final _pubBuffer = <_Pub>[];
+  /// Heartbeat ping interval duration
+  Duration pingInterval = const Duration(seconds: 120);
+
+  /// Maximum outstanding heartbeat pings allowed before reconnecting
+  int maxPingsOut = 2;
+  Timer? _pingTimer;
+  int _pingsOut = 0;
+
+  /// Maximum number of messages to buffer during reconnection
+  int maxReconnectBuffer = 1000;
+  int _reconnectTimeout = 5;
+  int _reconnectInterval = 10;
+  int _reconnectCount = 3;
+  bool _wasConnected = false;
+  bool _reconnecting = false;
 
   int _ssid = 0;
   int _connectionId = 0;
@@ -411,13 +426,27 @@ class Client {
     int retryInterval = 10,
     int retryCount = 3,
     SecurityContext? securityContext,
+    Duration pingInterval = const Duration(seconds: 120),
+    int maxPingsOut = 2,
+    bool randomizeServers = true,
+    int maxReconnectBuffer = 1000,
   }) async {
     _retry = retry;
     this.securityContext = securityContext;
+    this.pingInterval = pingInterval;
+    this.maxPingsOut = maxPingsOut;
+    this.maxReconnectBuffer = maxReconnectBuffer;
+    _reconnectTimeout = timeout;
+    _reconnectInterval = retryInterval;
+    _reconnectCount = retryCount;
+
     _connectCompleter = Completer<void>();
     _serverPool = [uri];
     if (servers != null) {
       _serverPool.addAll(servers);
+    }
+    if (randomizeServers) {
+      _serverPool.shuffle();
     }
     _currentServerIndex = 0;
 
@@ -434,35 +463,11 @@ class Client {
       _connectOption = connectOption;
     }
 
-    do {
-      _connectLoop(
-        timeout: timeout,
-        retryInterval: retryInterval,
-        retryCount: retryCount,
-      );
-
-      if (_clientStatus == _ClientStatus.closed || status == Status.closed) {
-        if (!_connectCompleter.isCompleted) {
-          _connectCompleter.complete();
-        }
-        await close();
-        _clientStatus = _ClientStatus.closed;
-        return;
-      }
-
-      if (!_retry || retryCount != -1) {
-        return _connectCompleter.future;
-      }
-
-      await for (final s in statusStream) {
-        if (s == Status.disconnected) {
-          break;
-        }
-        if (s == Status.closed) {
-          return;
-        }
-      }
-    } while (_retry && retryCount == -1);
+    _connectLoop(
+      timeout: timeout,
+      retryInterval: retryInterval,
+      retryCount: retryCount,
+    );
 
     return _connectCompleter.future;
   }
@@ -654,6 +659,7 @@ class Client {
     for (final p in _pubBuffer) {
       _pub(p);
     }
+    _pubBuffer.clear();
   }
 
   void _processOp(String line, int lineEnd) async {
@@ -689,6 +695,25 @@ class Client {
       case 'info':
         try {
           _info = Info.fromJson(jsonDecode(data) as Map<String, dynamic>);
+
+          if (_info.connectUrls != null) {
+            for (var urlStr in _info.connectUrls!) {
+              var formatted = urlStr;
+              if (!formatted.contains('://')) {
+                final currentScheme =
+                    _serverPool.isNotEmpty ? _serverPool.first.scheme : 'nats';
+                formatted = '$currentScheme://$formatted';
+              }
+              try {
+                final discoveredUri = Uri.parse(formatted);
+                if (!_serverPool.any((u) =>
+                    u.host == discoveredUri.host &&
+                    u.port == discoveredUri.port)) {
+                  _serverPool.add(discoveredUri);
+                }
+              } catch (_) {}
+            }
+          }
 
           if (_connectOptionSent) {
             break;
@@ -909,6 +934,10 @@ class Client {
     buffer ??= defaultPubBuffer;
     if (status != Status.connected) {
       if (buffer) {
+        if (maxReconnectBuffer != -1 &&
+            _pubBuffer.length >= maxReconnectBuffer) {
+          throw NatsException('reconnect buffer full');
+        }
         _pubBuffer.add(_Pub(subject, data, replyTo));
         return true;
       } else {
@@ -1248,19 +1277,94 @@ class Client {
     _statusController.add(newStatus);
 
     if (newStatus == Status.connected) {
+      _wasConnected = true;
+      _pingsOut = 0;
+      _pingTimer?.cancel();
+      _pingTimer = Timer.periodic(pingInterval, (timer) {
+        if (status != Status.connected) {
+          timer.cancel();
+          return;
+        }
+        if (_pingsOut >= maxPingsOut) {
+          timer.cancel();
+          _setStatus(Status.disconnected);
+          _cleanUpSockets();
+          return;
+        }
+        _pingsOut++;
+        _add('ping');
+      });
       if (oldStatus == Status.reconnecting && onReconnect != null) {
         onReconnect!();
       } else if (onConnect != null) {
         onConnect!();
       }
     } else if (newStatus == Status.disconnected) {
+      _pingTimer?.cancel();
+      _pingTimer = null;
+      _pingsOut = 0;
       if (onDisconnect != null) {
         onDisconnect!();
       }
+      if (_wasConnected && _retry && !_reconnecting) {
+        _reconnectLoopBackground();
+      }
     } else if (newStatus == Status.closed) {
+      _wasConnected = false;
+      _pingTimer?.cancel();
+      _pingTimer = null;
+      _pingsOut = 0;
       if (onClose != null) {
         onClose!();
       }
+    }
+  }
+
+  void _reconnectLoopBackground() async {
+    if (_reconnecting) return;
+    _reconnecting = true;
+
+    int attempts = 0;
+    final maxAttempts = _reconnectCount == -1
+        ? -1
+        : _reconnectCount * _serverPool.length;
+
+    while (_retry &&
+        status == Status.disconnected &&
+        (attempts < maxAttempts || maxAttempts == -1)) {
+      _setStatus(Status.reconnecting);
+      final currentUri = _getNextServer();
+      try {
+        if (_channelStream.isClosed) {
+          _channelStream = StreamController<dynamic>();
+        }
+        _connectionId++;
+        final success =
+            await _connectUri(currentUri, timeout: _reconnectTimeout);
+        if (success) {
+          _buffer = Uint8List(0);
+          _bufferLength = 0;
+          _readOffset = 0;
+          _reconnecting = false;
+          return;
+        }
+      } catch (err) {
+        await _cleanUpSockets();
+        if (onError != null) {
+          onError!(err);
+        }
+      }
+      attempts++;
+      if (_retry &&
+          status == Status.disconnected &&
+          (attempts < maxAttempts || maxAttempts == -1)) {
+        await Future<void>.delayed(Duration(seconds: _reconnectInterval));
+      }
+    }
+
+    _reconnecting = false;
+    if (status == Status.disconnected) {
+      await close();
     }
   }
 

@@ -765,14 +765,24 @@ class JetStream {
     });
 
     streamSub = sub.stream.listen((msg) {
-      // Check if we got a NATS status header (e.g. 404 No Messages, 408 Request Timeout)
+      // Check if we got a NATS status header (e.g. 100 Idle Heartbeat, 404 No Messages, 408 Request Timeout)
       final statusHeader = msg.header?.status;
-      if (statusHeader != null && statusHeader >= 400) {
-        cleanup();
-        if (!completer.isCompleted) {
-          completer.complete(messages);
+      if (statusHeader != null) {
+        if (statusHeader >= 400) {
+          cleanup();
+          if (!completer.isCompleted) {
+            completer.complete(messages);
+          }
+          return;
         }
-        return;
+        if (statusHeader >= 100 && statusHeader < 300) {
+          // Idle Heartbeat or Flow Control
+          // Under flow control, respond if replyTo is present
+          if (msg.replyTo != null && msg.replyTo!.isNotEmpty) {
+            client.pub(msg.replyTo!, Uint8List(0));
+          }
+          return;
+        }
       }
 
       messages.add(msg);

@@ -446,4 +446,128 @@ SUACSSL3UAHUDXKFSNVUZRF5UHPMWZ6BFDTJ7M6USDXIEDNPPQYYYCU3VY
       await js.deleteObjectStore(bucket);
     });
   });
+
+  group('New enhancements (heartbeats, reconnect buffer, microservices)', () {
+    test('Heartbeat pings are sent and connection stays healthy', () async {
+      final client = Client();
+      await client.connect(
+        Uri.parse('nats://localhost:4222'),
+        retry: false,
+        pingInterval: const Duration(milliseconds: 200),
+        maxPingsOut: 2,
+      );
+
+      expect(client.connected, isTrue);
+      // Wait for a few pings to fire
+      await Future.delayed(const Duration(milliseconds: 600));
+      expect(client.connected, isTrue);
+
+      await client.close();
+    });
+
+    test('Reconnection works with finite retryCount after dropping', () async {
+      final client = Client();
+      final statusHistory = <Status>[];
+      client.statusStream.listen(statusHistory.add);
+
+      await client.connect(
+        Uri.parse('nats://localhost:4222'),
+        retry: true,
+        retryCount: 5,
+        retryInterval: 1,
+      );
+
+      expect(client.connected, isTrue);
+
+      // Force disconnected state
+      await client.tcpClose();
+
+      // Wait until reconnection automatically happens
+      await client.waitUntilConnected();
+      expect(client.connected, isTrue);
+
+      // Verify that we transitioned through disconnected and reconnecting states
+      expect(statusHistory, contains(Status.disconnected));
+      expect(statusHistory, contains(Status.reconnecting));
+
+      await client.close();
+    });
+
+    test('Reconnect buffer limit throws exception when exceeded', () async {
+      final client = Client();
+      await client.connect(
+        Uri.parse('nats://localhost:4222'),
+        retry: false,
+        maxReconnectBuffer: 2,
+      );
+
+      // Force disconnected state
+      await client.tcpClose();
+      await Future.delayed(const Duration(milliseconds: 50));
+      expect(client.connected, isFalse);
+
+      // Publish within limit
+      final pub1 = await client.pubString('buf.test', 'msg1');
+      final pub2 = await client.pubString('buf.test', 'msg2');
+      expect(pub1, isTrue);
+      expect(pub2, isTrue);
+
+      // Exceed limit -> should throw
+      expect(
+        () => client.pubString('buf.test', 'msg3'),
+        throwsA(isA<NatsException>()),
+      );
+
+      await client.close();
+    });
+
+    test('NATS Microservices Framework (ADR-32) endpoints & monitoring', () async {
+      final client = Client();
+      await client.connect(Uri.parse('nats://localhost:4222'), retry: false);
+
+      final service = await client.addService(ServiceConfig(
+        name: 'test-service',
+        version: '1.2.3',
+        description: 'Test Microservice',
+        metadata: {'env': 'test'},
+        endpoints: [
+          Endpoint(
+            name: 'hello',
+            subject: 'service.hello',
+            handler: (msg) {
+              msg.respondString('hello-response');
+            },
+          ),
+        ],
+      ));
+
+      // 1. Call service endpoint
+      final resp = await client.requestString('service.hello', 'input');
+      expect(resp.string, equals('hello-response'));
+
+      // 2. Query PING
+      final pingResp = await client.requestString('\$SRV.PING.test-service', '');
+      final pingMap = jsonDecode(pingResp.string);
+      expect(pingMap['name'], equals('test-service'));
+      expect(pingMap['version'], equals('1.2.3'));
+
+      // 3. Query INFO
+      final infoResp = await client.requestString('\$SRV.INFO.test-service', '');
+      final infoMap = jsonDecode(infoResp.string);
+      expect(infoMap['name'], equals('test-service'));
+      expect(infoMap['description'], equals('Test Microservice'));
+      expect(infoMap['endpoints'][0]['name'], equals('hello'));
+
+      // 4. Query STATS
+      final statsResp = await client.requestString('\$SRV.STATS.test-service', '');
+      final statsMap = jsonDecode(statsResp.string);
+      expect(statsMap['name'], equals('test-service'));
+      final epStats = statsMap['stats']['endpoints'][0];
+      expect(epStats['name'], equals('hello'));
+      expect(epStats['num_requests'], equals(1));
+
+      await service.stop();
+      await client.close();
+    });
+  });
 }
